@@ -1,5 +1,6 @@
 #  *\<vector\<tile\>\>map*
 
+[![Build Status](https://travis-ci.org/hanchao/vtm.svg)](https://travis-ci.org/hanchao/vtm)
 <br/>
 http://www.opensciencemap.org<br/>
 VTM is part of the OpenScienceMap project and developed at University of Bremen.
