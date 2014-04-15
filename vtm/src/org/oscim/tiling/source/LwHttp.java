@@ -24,29 +24,27 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.URL;
-import java.util.Map;
 import java.util.Map.Entry;
+import java.util.zip.GZIPInputStream;
 
 import org.oscim.core.Tile;
 import org.oscim.utils.ArrayUtils;
+import org.oscim.utils.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Lightweight HTTP connection for tile loading. Does not do redirects,
- * https, full header parsing or stuff.
- * 
- * TODO extract API interface to be used by UrlTileSource so that one
- * could also use HttpUrlConnection, etc.
+ * https, full header parsing or other stuff.
  */
-public class LwHttp {
+public class LwHttp implements HttpEngine {
 	static final Logger log = LoggerFactory.getLogger(LwHttp.class);
 	static final boolean dbg = false;
 
 	private final static byte[] HEADER_HTTP_OK = "200 OK".getBytes();
-	//private final static byte[] HEADER_CONTENT_TYPE = "Content-Type".getBytes();
 	private final static byte[] HEADER_CONTENT_LENGTH = "Content-Length".getBytes();
 	private final static byte[] HEADER_CONNECTION_CLOSE = "Connection: close".getBytes();
+	private final static byte[] HEADER_ENCODING_GZIP = "Content-Encoding: gzip".getBytes();
 
 	private final static int RESPONSE_EXPECTED_LIVES = 100;
 	private final static long RESPONSE_TIMEOUT = (long) 10E9; // 10 second in nanosecond
@@ -57,7 +55,7 @@ public class LwHttp {
 	private final String mHost;
 	private final int mPort;
 
-	private int mMaxReq = 0;
+	private int mMaxRequests = 0;
 	private Socket mSocket;
 	private OutputStream mCommandStream;
 	private Buffer mResponseStream;
@@ -71,53 +69,52 @@ public class LwHttp {
 	private final byte[] REQUEST_GET_END;
 	private final byte[] mRequestBuffer;
 
-	/**
-	 * @param url
-	 *            Base url for tiles
-	 */
-	public LwHttp(URL url) {
-		this(url, null);
-	}
+	private final byte[][] mTilePath;
+	private final UrlTileSource mTileSource;
 
-	public LwHttp(URL url, Map<String, String> header) {
+	//private boolean mUseGZIP;
 
+	private LwHttp(UrlTileSource tileSource, byte[][] tilePath) {
+		mTilePath = tilePath;
+		mTileSource = tileSource;
+
+		URL url = tileSource.getUrl();
 		int port = url.getPort();
 		if (port < 0)
 			port = 80;
 
-		String host = url.getHost();
+		mHost = url.getHost();
+		mPort = port;
+
 		String path = url.getPath();
-		log.debug("open database: " + host + " " + port + " " + path);
 
 		REQUEST_GET_START = ("GET " + path).getBytes();
 
-		String addRequest = "";
-		if (header != null) {
-			StringBuffer sb = new StringBuffer();
-			for (Entry<String, String> l : header.entrySet())
-				sb.append('\n').append(l.getKey()).append(": ").append(l.getValue());
-			addRequest = sb.toString();
+		StringBuilder sb = new StringBuilder()
+		    .append(" HTTP/1.1")
+		    .append("\nUser-Agent: vtm/0.5.9")
+		    .append("\nHost: ")
+		    .append(mHost)
+		    .append("\nConnection: Keep-Alive");
+
+		for (Entry<String, String> l : tileSource.getRequestHeader().entrySet()) {
+			String key = l.getKey();
+			String val = l.getValue();
+			//if ("Accept-Encoding".equals(key) && "gzip".equals(val))
+			//	mUseGZIP = true;
+			sb.append('\n').append(key).append(": ").append(val);
 		}
+		sb.append("\n\n");
 
-		REQUEST_GET_END = (" HTTP/1.1" +
-		        "\nUser-Agent: vtm/0.5.9" +
-		        "\nHost: " + host +
-		        "\nConnection: Keep-Alive" +
-		        addRequest +
-		        "\n\n").getBytes();
-
-		mHost = host;
-		mPort = port;
+		REQUEST_GET_END = sb.toString().getBytes();
 
 		mRequestBuffer = new byte[1024];
 		System.arraycopy(REQUEST_GET_START, 0,
-		                 mRequestBuffer, 0, REQUEST_GET_START.length);
+		                 mRequestBuffer, 0,
+		                 REQUEST_GET_START.length);
 	}
 
-	// TODO:
-	// to avoid a copy in PbfDecoder one could manage the buffer
-	// array directly and provide access to it.
-	static class Buffer extends BufferedInputStream {
+	static final class Buffer extends BufferedInputStream {
 		OutputStream cache;
 		int bytesRead = 0;
 		int bytesWrote;
@@ -197,6 +194,7 @@ public class LwHttp {
 
 			if (marked >= 0)
 				bytesRead = marked;
+
 			/* TODO could check if the mark is already invalid */
 			super.reset();
 		}
@@ -210,9 +208,6 @@ public class LwHttp {
 
 			if (data >= 0)
 				bytesRead += 1;
-
-			//if (dbg)
-			//	log.debug("read {} {}", bytesRead, contentLength);
 
 			if (cache != null && bytesRead > bytesWrote) {
 				bytesWrote = bytesRead;
@@ -258,6 +253,7 @@ public class LwHttp {
 		byte[] buf = buffer;
 		boolean first = true;
 		boolean ok = true;
+		boolean gzip = false;
 
 		int read = 0;
 		int pos = 0;
@@ -288,27 +284,23 @@ public class LwHttp {
 				break;
 			}
 
-			if (!ok) {
-				/* ignore until end of header */
-			} else if (first) {
-				first = false;
-				/* check only for OK ("HTTP/1.? ".length == 9) */
-				if (!check(HEADER_HTTP_OK, buf, pos + 9, end))
-					ok = false;
+			if (ok) {
+				if (first) {
+					first = false;
+					/* check only for OK ("HTTP/1.? ".length == 9) */
+					if (!check(HEADER_HTTP_OK, buf, pos + 9, end))
+						ok = false;
 
-			} else if (check(HEADER_CONTENT_LENGTH, buf, pos, end)) {
-				/* parse Content-Length */
-				contentLength = parseInt(buf, pos +
-				        HEADER_CONTENT_LENGTH.length + 2, end - 1);
-			} else if (check(HEADER_CONNECTION_CLOSE, buf, pos, end)) {
-				mMustClose = true;
+				} else if (check(HEADER_CONTENT_LENGTH, buf, pos, end)) {
+					/* parse Content-Length */
+					contentLength = parseInt(buf, pos +
+					        HEADER_CONTENT_LENGTH.length + 2, end - 1);
+				} else if (check(HEADER_ENCODING_GZIP, buf, pos, end)) {
+					gzip = true;
+				} else if (check(HEADER_CONNECTION_CLOSE, buf, pos, end)) {
+					mMustClose = true;
+				}
 			}
-			//} else if (check(HEADER_CONTENT_TYPE, buf, pos, end)) {
-			// check that response contains the expected
-			// Content-Type
-			//if (!check(mContentType, buf, pos +
-			//        HEADER_CONTENT_TYPE.length + 2, end))
-			//	ok = false;
 
 			if (!ok || dbg) {
 				String line = new String(buf, pos, end - pos - 1);
@@ -328,20 +320,27 @@ public class LwHttp {
 		is.skip(end);
 		is.start(contentLength);
 
+		if (gzip) {
+			return new GZIPInputStream(is);
+		}
 		return is;
 	}
 
-	public boolean sendRequest(UrlTileSource tileSource, Tile tile) throws IOException {
+	@Override
+	public void sendRequest(Tile tile) throws IOException {
 
 		if (mSocket != null) {
-			if (mMaxReq-- <= 0)
+			if (--mMaxRequests < 0)
 				close();
 			else if (System.nanoTime() - mLastRequest > RESPONSE_TIMEOUT)
 				close();
 			else {
 				try {
-					if (mResponseStream.available() > 0)
+					int n = mResponseStream.available();
+					if (n > 0) {
+						log.debug("left over bytes {} ", n);
 						close();
+					}
 				} catch (IOException e) {
 					log.debug(e.getMessage());
 					close();
@@ -354,36 +353,32 @@ public class LwHttp {
 			lwHttpConnect();
 
 			/* TODO parse from header */
-			mMaxReq = RESPONSE_EXPECTED_LIVES;
+			mMaxRequests = RESPONSE_EXPECTED_LIVES;
 		}
 
-		byte[] request = mRequestBuffer;
 		int pos = REQUEST_GET_START.length;
-
-		pos = tileSource.formatTilePath(tile, request, pos);
-
 		int len = REQUEST_GET_END.length;
-		System.arraycopy(REQUEST_GET_END, 0, request, pos, len);
+
+		pos = formatTilePath(tile, mRequestBuffer, pos);
+		System.arraycopy(REQUEST_GET_END, 0, mRequestBuffer, pos, len);
 		len += pos;
 
 		if (dbg)
-			log.debug("request: {}", new String(request, 0, len));
+			log.debug("request: {}", new String(mRequestBuffer, 0, len));
 
 		try {
-			mCommandStream.write(request, 0, len);
-			mCommandStream.flush();
-			return true;
+			writeRequest(mRequestBuffer, len);
 		} catch (IOException e) {
 			log.debug("recreate connection");
 			close();
-			/* might throw IOException */
 			lwHttpConnect();
-
-			mCommandStream.write(request, 0, len);
-			mCommandStream.flush();
+			writeRequest(mRequestBuffer, len);
 		}
+	}
 
-		return true;
+	private void writeRequest(byte[] request, int length) throws IOException {
+		mCommandStream.write(request, 0, length);
+		mCommandStream.flush();
 	}
 
 	private boolean lwHttpConnect() throws IOException {
@@ -404,19 +399,18 @@ public class LwHttp {
 		return true;
 	}
 
+	@Override
 	public void close() {
 		if (mSocket == null)
 			return;
 
-		try {
-			mSocket.close();
-		} catch (IOException e) {
-		}
+		IOUtils.closeQuietly(mSocket);
 		mSocket = null;
 		mCommandStream = null;
 		mResponseStream = null;
 	}
 
+	@Override
 	public void setCache(OutputStream os) {
 		if (mResponseStream == null)
 			return;
@@ -424,6 +418,7 @@ public class LwHttp {
 		mResponseStream.setCache(os);
 	}
 
+	@Override
 	public boolean requestCompleted(boolean success) {
 		if (mResponseStream == null)
 			return false;
@@ -432,15 +427,6 @@ public class LwHttp {
 		mResponseStream.setCache(null);
 
 		if (!mResponseStream.finishedReading()) {
-			//	StringBuffer sb = new StringBuffer();
-			//	try {
-			//		int val;
-			//		while ((val = mResponseStream.read()) >= 0)
-			//			sb.append((char) val);
-			//	} catch (IOException e) {
-			//
-			//	}
-			//log.debug("invalid buffer position {}", sb.toString());
 			log.debug("invalid buffer position");
 			close();
 			return true;
@@ -460,7 +446,7 @@ public class LwHttp {
 	}
 
 	/** write (positive) integer to byte array */
-	public static int writeInt(int val, int pos, byte[] buf) {
+	private static int writeInt(int val, int pos, byte[] buf) {
 		if (val == 0) {
 			buf[pos] = '0';
 			return pos + 1;
@@ -476,7 +462,7 @@ public class LwHttp {
 	}
 
 	/** parse (positive) integer from byte array */
-	protected static int parseInt(byte[] buf, int pos, int end) {
+	private static int parseInt(byte[] buf, int pos, int end) {
 		int val = 0;
 		for (; pos < end; pos++)
 			val = val * 10 + (buf[pos]) - '0';
@@ -497,5 +483,62 @@ public class LwHttp {
 				return false;
 
 		return true;
+	}
+
+	/**
+	 * @param tile the Tile
+	 * @param buf to write url string
+	 * @param pos current position
+	 * @return new position
+	 */
+	private int formatTilePath(Tile tile, byte[] buf, int pos) {
+		if (mTilePath == null) {
+			String url = mTileSource.getUrlFormatter()
+			    .formatTilePath(mTileSource, tile);
+			byte[] b = url.getBytes();
+			System.arraycopy(b, 0, buf, pos, b.length);
+			return pos + b.length;
+		}
+
+		for (byte[] b : mTilePath) {
+			if (b.length == 1) {
+				if (b[0] == '/') {
+					buf[pos++] = '/';
+					continue;
+				} else if (b[0] == 'X') {
+					pos = writeInt(tile.tileX, pos, buf);
+					continue;
+				} else if (b[0] == 'Y') {
+					pos = writeInt(tile.tileY, pos, buf);
+					continue;
+				} else if (b[0] == 'Z') {
+					pos = writeInt(tile.zoomLevel, pos, buf);
+					continue;
+				}
+			}
+			System.arraycopy(b, 0, buf, pos, b.length);
+			pos += b.length;
+		}
+		return pos;
+
+	}
+
+	public static class LwHttpFactory implements HttpEngine.Factory {
+		private byte[][] mTilePath;
+
+		@Override
+		public HttpEngine create(UrlTileSource tileSource) {
+			if (tileSource.getUrlFormatter() != UrlTileSource.URL_FORMATTER)
+				return new LwHttp(tileSource, null);
+
+			/* use optimized formatter replacing the default */
+			if (mTilePath == null) {
+				String[] path = tileSource.getTilePath();
+				mTilePath = new byte[path.length][];
+				for (int i = 0; i < path.length; i++)
+					mTilePath[i] = path[i].getBytes();
+			}
+			return new LwHttp(tileSource, mTilePath);
+		}
 	}
 }
